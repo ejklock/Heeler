@@ -1,0 +1,223 @@
+# Temporary crash diagnosis only; never merge this workflow into main.
+name: Temporary keyboard crash diagnosis (615)
+
+on:
+  push:
+    branches: [tmp/diagnose-crash-615]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CANDIDATE_SHA: 148256743e9bfc0765fa59c75e6928b08f1a366c
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  HEELER_SSH_E2E_REQUIRED: '0'
+
+jobs:
+  repeat:
+    name: Whole app (${{ matrix.worker }}, four rounds)
+    runs-on: macos-26
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Record candidate and select the original Simulator
+        id: simulator
+        run: |
+          mkdir -p "$RUNNER_TEMP/crash-615"
+          touch "$RUNNER_TEMP/crash-615/started"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          {
+            git rev-parse HEAD
+            xcodebuild -version
+            sw_vers
+            printf 'image_version=%s\n' "$ImageVersion"
+            shasum -a 256 Tests/HeelerTests/AgentDirectInputTests.swift
+          } | tee "$RUNNER_TEMP/crash-615/candidate.txt"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, subprocess
+          devices = json.loads(subprocess.check_output([
+              "xcrun", "simctl", "list", "devices", "available", "--json"]))["devices"]
+          matches = [device for device in devices.get("com.apple.CoreSimulator.SimRuntime.iOS-26-5", [])
+                     if device["name"] == "iPhone 17"]
+          if len(matches) != 1:
+              raise SystemExit("Expected one available iPhone 17 / iOS 26.5 Simulator")
+          print(f"udid={matches[0]['udid']}")
+          PY
+      - name: Restore dependency sources without writing shared caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .ci/source-packages
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('Heeler.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+      - name: Compute compilation cache key
+        id: cache-key
+        run: scripts/ci-compilation-cache-prefix.sh ios-fast-cas-v1
+      - name: Restore compiler objects without writing shared caches
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci/app-compilation-cache
+          key: ${{ steps.cache-key.outputs.cache-prefix }}${{ env.CANDIDATE_SHA }}
+          restore-keys: |
+            ${{ steps.cache-key.outputs.cache-prefix }}
+      - name: Verify SSH artifacts
+        run: make verify-ssh-artifacts
+      - name: Build the unchanged committed app and tests
+        timeout-minutes: 35
+        run: make build-ci-app 2>&1 | tee "$RUNNER_TEMP/crash-615/build.log"
+      - name: Run four whole-app invocations and retain every outcome
+        timeout-minutes: 80
+        env:
+          UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl spawn "$UDID" launchctl setenv HEELER_SSH_E2E_REQUIRED 0
+          python3 -u - <<'PY'
+          import datetime, json, os, pathlib, signal, subprocess
+
+          results = pathlib.Path(os.environ["RUNNER_TEMP"]) / "crash-615"
+          target = "AgentDirectInputTests/composerAndDirectInputTransferVisibleKeyboardWithoutReloading()"
+          # Match the original whole-app invocation: scheme defaults, no SSH
+          # fixtures, no sanitizer and no test selectors or repetition flags.
+          command = [
+              "python3", "scripts/run-app-simulator-tests.py", "test-without-building",
+              "-project", "Heeler.xcodeproj", "-scheme", "Heeler",
+              "-derivedDataPath", str(pathlib.Path.cwd() / ".ci/app-derived"),
+              "-clonedSourcePackagesDirPath", str(pathlib.Path.cwd() / ".ci/source-packages"),
+              "-disableAutomaticPackageResolution",
+              "-destination", f"platform=iOS Simulator,id={os.environ['UDID']}",
+              "-collect-test-diagnostics", "on-failure",
+          ]
+
+          def walk(nodes):
+              for node in nodes:
+                  yield node
+                  yield from walk(node.get("children", []))
+
+          def export(arguments, output):
+              try:
+                  with output.open("w") as handle:
+                      completed = subprocess.run(arguments, stdout=handle, stderr=subprocess.PIPE,
+                                                 text=True, timeout=180)
+                  output.with_suffix(output.suffix + ".stderr").write_text(completed.stderr)
+                  return completed.returncode == 0
+              except subprocess.TimeoutExpired:
+                  output.with_suffix(output.suffix + ".stderr").write_text("Diagnostic export timed out\n")
+                  return False
+
+          for number in range(1, 5):
+              prefix = results / f"full-{number}"
+              bundle = prefix.with_suffix(".xcresult")
+              args = command + ["-resultBundlePath", str(bundle)]
+              record = {"round": number, "candidate": os.environ["CANDIDATE_SHA"], "command": args,
+                        "started": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+              print(f"Starting whole-app round {number}/4", flush=True)
+              with prefix.with_suffix(".log").open("w") as log:
+                  process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                  try:
+                      record["exit_code"] = process.wait(timeout=900)
+                  except subprocess.TimeoutExpired:
+                      record["timed_out"] = True
+                      os.killpg(process.pid, signal.SIGTERM)
+                      try:
+                          process.wait(timeout=30)
+                      except subprocess.TimeoutExpired:
+                          os.killpg(process.pid, signal.SIGKILL)
+                          process.wait()
+                      record["exit_code"] = 124
+              record["finished"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              # Write the exit status before attempting any diagnostic export.
+              prefix.with_suffix(".outcome.json").write_text(json.dumps(record, indent=2) + "\n")
+              for kind in ("summary", "tests"):
+                  output = prefix.with_suffix(f".{kind}.json")
+                  record[f"{kind}_exported"] = export(
+                      ["xcrun", "xcresulttool", "get", "test-results", kind, "--path", str(bundle)], output)
+              if record["tests_exported"]:
+                  tests = json.loads(prefix.with_suffix(".tests.json").read_text())
+                  record["handoff_results"] = [node.get("result") for node in walk(tests["testNodes"])
+                      if node.get("nodeType") == "Test Case" and node.get("nodeIdentifier") == target]
+              if record["exit_code"] != 0:
+                  record["diagnostics_exported"] = export(
+                      ["xcrun", "xcresulttool", "export", "diagnostics", "--path", str(bundle),
+                       "--output-path", str(prefix.with_suffix(".diagnostics"))],
+                      prefix.with_suffix(".diagnostics.log"))
+              prefix.with_suffix(".outcome.json").write_text(json.dumps(record, indent=2) + "\n")
+              print(json.dumps(record), flush=True)
+          PY
+      - name: Preserve host and Simulator crash reports
+        if: always()
+        env:
+          UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, shutil
+          results = pathlib.Path(os.environ["RUNNER_TEMP"]) / "crash-615"
+          started = results / "started"
+          if not started.exists():
+              raise SystemExit("Missing diagnostic start marker")
+          roots = {"host": pathlib.Path.home() / "Library/Logs/DiagnosticReports"}
+          if os.environ.get("UDID"):
+              roots["simulator"] = pathlib.Path.home() / "Library/Developer/CoreSimulator/Devices" / os.environ["UDID"] / "data/Library/Logs"
+          for label, root in roots.items():
+              for source in root.rglob("Heeler*"):
+                  if source.is_file() and source.suffix in {".ips", ".crash"} and source.stat().st_mtime >= started.stat().st_mtime:
+                      destination = results / "crash-reports" / label / source.relative_to(root)
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(source, destination)
+                      print(destination.relative_to(results))
+          PY
+      - name: Require all four invocations and the original handoff test
+        if: ${{ !cancelled() }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          results = pathlib.Path(os.environ["RUNNER_TEMP"]) / "crash-615"
+          failures = []
+          lines = [f"Candidate: {os.environ['CANDIDATE_SHA']}", "",
+                   "Ordinary-like crash diagnosis without SSH fixtures; not full verification.", ""]
+          for number in range(1, 5):
+              try:
+                  record = json.loads((results / f"full-{number}.outcome.json").read_text())
+                  summary = json.loads((results / f"full-{number}.summary.json").read_text())
+                  valid = (record["candidate"] == os.environ["CANDIDATE_SHA"]
+                           and record["exit_code"] == 0 and record.get("handoff_results") == ["Passed"]
+                           and summary["result"] == "Passed" and summary["failedTests"] == 0
+                           and summary.get("expectedFailures", 0) == 0
+                           and summary["totalTestCount"] == 4941 and summary["skippedTests"] == 151)
+                  lines.append(f"- Round {number}: exit={record['exit_code']}, handoff={record.get('handoff_results')}, summary={summary['result']}, failed={summary['failedTests']}, skipped={summary['skippedTests']}")
+              except (OSError, ValueError, KeyError) as error:
+                  valid = False
+                  lines.append(f"- Round {number}: incomplete evidence ({error})")
+              if not valid:
+                  failures.append(number)
+          report = "\n".join(lines) + "\n"
+          print(report)
+          (results / "outcome.txt").write_text(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+              handle.write(report)
+          if failures:
+              raise SystemExit(f"Failed or incomplete rounds: {failures}")
+          PY
+      - name: Upload all results and crash diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-615-worker-${{ matrix.worker }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crash-615
+          if-no-files-found: error
+          retention-days: 14
