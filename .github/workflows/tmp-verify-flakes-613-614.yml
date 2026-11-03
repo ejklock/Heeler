@@ -13,7 +13,7 @@ defaults:
     shell: bash
 
 env:
-  CANDIDATE_SHA: be96436aabe3371df90a62f24ef698aff42098dc
+  CANDIDATE_SHA: 148256743e9bfc0765fa59c75e6928b08f1a366c
   DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
 
 jobs:
