@@ -1,0 +1,134 @@
+# Temporary acceptance only; never merge this workflow into main.
+name: Temporary flaky-test acceptance (613, 614)
+
+on:
+  push:
+    branches: [tmp/verify-flakes-613-614]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CANDIDATE_SHA: be96436aabe3371df90a62f24ef698aff42098dc
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  repeat:
+    runs-on: macos-26
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Record candidate and select the original Simulator
+        id: simulator
+        run: |
+          mkdir -p "$RUNNER_TEMP/flake-acceptance"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          {
+            git rev-parse HEAD
+            xcodebuild -version
+            sw_vers
+            printf 'image_version=%s\n' "$ImageVersion"
+            shasum -a 256 Tests/HeelerTests/EventsSessionSubscriptionsTests.swift Tests/HeelerTests/ConsoleTerminalInventoryTests.swift
+          } | tee "$RUNNER_TEMP/flake-acceptance/candidate.txt"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, subprocess
+          devices = json.loads(subprocess.check_output([
+              "xcrun", "simctl", "list", "devices", "available", "--json"]))["devices"]
+          matches = [device for device in devices.get("com.apple.CoreSimulator.SimRuntime.iOS-26-5", [])
+                     if device["name"] == "iPhone 17"]
+          if len(matches) != 1:
+              raise SystemExit("Expected one available iPhone 17 / iOS 26.5 Simulator")
+          print(f"udid={matches[0]['udid']}")
+          PY
+      - name: Restore dependency sources
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .ci/source-packages
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('Heeler.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+      - name: Compute compilation cache key
+        id: cache-key
+        run: scripts/ci-compilation-cache-prefix.sh ios-fast-cas-v1
+      - name: Restore compiler objects without writing shared caches
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci/app-compilation-cache
+          key: ${{ steps.cache-key.outputs.cache-prefix }}${{ env.CANDIDATE_SHA }}
+          restore-keys: |
+            ${{ steps.cache-key.outputs.cache-prefix }}
+      - name: Verify SSH artifacts
+        run: make verify-ssh-artifacts
+      - name: Build committed app and tests
+        timeout-minutes: 35
+        run: make build-ci-app 2>&1 | tee "$RUNNER_TEMP/flake-acceptance/build.log"
+      - name: Run both original assertions 100 times
+        timeout-minutes: 15
+        env:
+          UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          python3 scripts/run-app-simulator-tests.py test-without-building \
+            -project Heeler.xcodeproj -scheme Heeler \
+            -derivedDataPath "$GITHUB_WORKSPACE/.ci/app-derived" \
+            -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.ci/source-packages" \
+            -disableAutomaticPackageResolution \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -resultBundlePath "$RUNNER_TEMP/flake-acceptance/repeat.xcresult" \
+            -parallel-testing-enabled NO -test-iterations 100 \
+            '-only-testing:HeelerTests/EventsSessionSubscriptionsTests/aRequestWaitsOutTheSilentTransportReplacement()' \
+            '-only-testing:HeelerTests/ConsoleTerminalInventoryTests/paneUpdateDuringSnapshotSurvivesItsOlderResponse()' \
+            2>&1 | tee "$RUNNER_TEMP/flake-acceptance/repeat.log"
+      - name: Require every repetition to pass
+        if: ${{ !cancelled() }}
+        run: |
+          results="$RUNNER_TEMP/flake-acceptance"
+          xcrun xcresulttool get test-results summary --path "$results/repeat.xcresult" --compact > "$results/summary.json"
+          xcrun xcresulttool get test-results tests --path "$results/repeat.xcresult" --compact > "$results/tests.json"
+          python3 - <<'PY'
+          import collections, json, os, pathlib
+          results = pathlib.Path(os.environ["RUNNER_TEMP"]) / "flake-acceptance"
+          summary = json.loads((results / "summary.json").read_text())
+          tests = json.loads((results / "tests.json").read_text())
+          expected = {
+              "EventsSessionSubscriptionsTests/aRequestWaitsOutTheSilentTransportReplacement()",
+              "ConsoleTerminalInventoryTests/paneUpdateDuringSnapshotSurvivesItsOlderResponse()",
+          }
+          def walk(nodes):
+              for node in nodes:
+                  yield node
+                  yield from walk(node.get("children", []))
+          cases = [node for node in walk(tests["testNodes"]) if node.get("nodeType") == "Test Case"]
+          assert len(cases) == 2 and {node["nodeIdentifier"] for node in cases} == expected, "Missing or unexpected tests"
+          assert summary["result"] == "Passed" and summary["failedTests"] == 0 and summary["skippedTests"] == 0, summary
+          lines = [f"Candidate: {os.environ['CANDIDATE_SHA']}", ""]
+          for case in cases:
+              repetitions = [node for node in walk(case.get("children", [])) if node.get("nodeType") == "Repetition"]
+              counts = collections.Counter(node["result"] for node in repetitions)
+              assert counts == {"Passed": 100}, (case["nodeIdentifier"], counts)
+              assert len({node["nodeIdentifier"] for node in repetitions}) == 100, "Duplicate repetitions"
+              lines.append(f"- {case['nodeIdentifier']}: 100/100 passed, no skips")
+          report = "\n".join(lines) + "\n"
+          print(report)
+          (results / "acceptance.txt").write_text(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+              handle.write(report)
+          PY
+      - name: Preserve all outcomes and identity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flaky-tests-613-614-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/flake-acceptance
+          if-no-files-found: error
+          retention-days: 14
