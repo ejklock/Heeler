@@ -140,9 +140,10 @@ default:
 }
 """
 
-# The node probe's fixed system locations. Tests move them under the fake root,
+# The probe's fixed system locations. Tests move them under the fake root,
 # so what this machine has installed cannot answer for a layout.
 SYSTEM_PREFIXES = (
+    "/var/lib/systemd/linger/",
     "/opt/homebrew/",
     "/usr/local/",
     "/home/linuxbrew/",
@@ -267,6 +268,8 @@ class HelperScriptCase(unittest.TestCase):
         ).stdout
 
     def run_script(self, shell: str = "/bin/sh", **step) -> subprocess.CompletedProcess:
+        if shell.split()[0] == "busybox" and self.env.get("FAKE_KERNEL", "Linux") != "Linux":
+            self.skipTest("busybox sh runs its own uname applet before PATH, so the kernel stub cannot reach it")
         text = self.script(**step)
         for prefix in SYSTEM_PREFIXES:
             text = text.replace(prefix, f"{self.root}/abs{prefix}")
@@ -698,10 +701,16 @@ class ExtensionFolderStepTests(HelperScriptCase):
     LISTER = ROOT / "plugin/helper/extensions/extension-folders.js"
 
     def list_folders(self, shell: str = "/bin/sh") -> list:
-        node = shutil.which("node")
-        self.assertIsNotNone(node, "this test needs Node.js")
+        found = shutil.which("node")
+        self.assertIsNotNone(found, "this test needs Node.js")
+        # run_script moves system prefixes such as /usr/local/ into the test root,
+        # so the Node it runs is reached through a link outside them.
+        node = self.root / "node" / "node"
+        if not node.exists():
+            node.parent.mkdir()
+            node.symlink_to(found)
         result = self.run_script(
-            shell, step="listExtensionFolders", node=node,
+            shell, step="listExtensionFolders", node=str(node),
             lister=self.LISTER.read_text(), home=str(self.home),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
