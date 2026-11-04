@@ -1584,19 +1584,28 @@ struct HerdrCoreTerminalStoreTests {
 
     // MARK: What a core Agent's detail offers
 
+    /// The header's toggle names the next state of the device's stored header
+    /// choice, which other tests in this process change.
+    private static var headerToggle: String {
+        UserDefaults.standard.bool(forKey: "agent.back-header-expanded") ? "Collapse" : "Expand"
+    }
     /// The header's More, and the Composer's, whose Add has a button of its own.
-    private static let coreAgentMenus: Set<[String]> = [
-        ["Terminals", "Changes", "Collapse"],
-        ["Back to Console", "Show Chat", "Open Terminal", "Changes", "New Agent", "Skills", "Snippets", "Close Agent"],
-    ]
-    /// Direct Input has no Add of its own: its More carries the same two items.
-    private static let coreDirectInputMenus: Set<[String]> = [
-        ["Terminals", "Changes", "Collapse"],
+    private static var coreAgentMenus: Set<[String]> {
         [
-            "Back to Console", "Add Image", "Paste Image", "Add File", "Show Chat", "Open Terminal", "Changes",
-            "New Agent", "Skills", "Snippets", "Close Agent",
-        ],
-    ]
+            ["Terminals", "Changes", headerToggle],
+            ["Back to Console", "Show Chat", "Open Terminal", "Changes", "New Agent", "Skills", "Snippets", "Close Agent"],
+        ]
+    }
+    /// Direct Input has no Add of its own: its More carries the same two items.
+    private static var coreDirectInputMenus: Set<[String]> {
+        [
+            ["Terminals", "Changes", headerToggle],
+            [
+                "Back to Console", "Add Image", "Paste Image", "Add File", "Show Chat", "Open Terminal", "Changes",
+                "New Agent", "Skills", "Snippets", "Close Agent",
+            ],
+        ]
+    }
     /// On screen for a Host that has them; none are built for a core Host yet.
     private static let notBuiltLabels = ["Take Over", "Take Over Here"]
 
@@ -2426,7 +2435,7 @@ struct HerdrCoreTerminalStoreTests {
         try await Self.until("the terminal's menu") { screen.offers("More") }
 
         let menus = try await HostedMenu.items(labeled: "More", in: screen.window)
-        #expect(menus == [["Terminals", "Collapse"], ["Back to Console", "Close Terminal"]], "\(menus)")
+        #expect(menus == [["Terminals", Self.headerToggle], ["Back to Console", "Close Terminal"]], "\(menus)")
 
         try await HostedMenu.select("Terminals", labeled: "More", in: screen.window)
         try await Self.until("the drawer") { screen.offers("Hide Workspace terminals") }
