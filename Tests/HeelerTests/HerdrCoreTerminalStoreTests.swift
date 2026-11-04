@@ -1593,8 +1593,8 @@ struct HerdrCoreTerminalStoreTests {
     private static let coreDirectInputMenus: Set<[String]> = [
         ["Terminals", "Changes", "Collapse"],
         [
-            "Back to Console", "Add Image", "Add File", "Show Chat", "Open Terminal", "Changes", "New Agent", "Skills",
-            "Snippets", "Close Agent",
+            "Back to Console", "Add Image", "Paste Image", "Add File", "Show Chat", "Open Terminal", "Changes",
+            "New Agent", "Skills", "Snippets", "Close Agent",
         ],
     ]
     /// On screen for a Host that has them; none are built for a core Host yet.
