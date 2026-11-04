@@ -2,7 +2,8 @@ import Foundation
 
 /// The SQL behind each query (ADR 0025). Every statement reads one session
 /// from `session_v2`, `session_message`, `event_sequence` or
-/// `session_inbox`, and nothing writes. The statements stay within SQLite
+/// `session_inbox`, but for `recentSessions`, which reads a directory's roots
+/// from `session_v2`, and nothing writes. The statements stay within SQLite
 /// 3.25 with JSON1: window functions and `pragma_table_info` are fine, while
 /// `->`, `iif`, `FILTER`, `NULLS FIRST`, `HAVING` without `GROUP BY` and
 /// `ORDER BY` inside an aggregate are newer. They also stay shallow: SQLite
@@ -27,7 +28,10 @@ extension OpenCodeProbe {
     static let openRowLimit = 64
 
     static func statements(_ query: OpenCodeQuery) -> [String] {
-        let session = "'\(query.session.rawValue)'"
+        if case .recentSessions(let directory, let limit) = query.kind {
+            return [versionStatement, tablesStatement, layoutStatement, recentSessions(directory, limit: limit)]
+        }
+        let session = "'\(query.session?.rawValue ?? "")'"
         var statements = [
             versionStatement, tablesStatement, layoutStatement,
             "SELECT 'E ' || coalesce((SELECT seq FROM event_sequence WHERE aggregate_id = \(session)), '')",
@@ -77,8 +81,20 @@ extension OpenCodeProbe {
                 WITH \(slimmed(rows, outputLimit: max(0, outputLimit)))
                 SELECT 'R ' || \(rowObject(dataLimit: nil)) FROM r
                 """)
+        case .recentSessions:
+            break
         }
         return statements
+    }
+
+    /// The directory travels as hex, so nothing of it can leave its literal.
+    private static func recentSessions(_ directory: String, limit: Int) -> String {
+        let hex = directory.utf8.map { String(format: "%02x", $0) }.joined()
+        return """
+            SELECT 'Q ' || json_object('id',id,'title',substr(title,1,512),'updated',time_updated)
+              FROM session_v2 WHERE directory = CAST(x'\(hex)' AS TEXT) AND parent_id IS NULL
+             ORDER BY time_updated DESC LIMIT \(max(0, limit))
+            """
     }
 
     // MARK: Store checks
@@ -93,8 +109,11 @@ extension OpenCodeProbe {
          WHERE m IS NOT NULL
         """
 
-    /// Every column the queries name, so a changed layout reads as one
-    /// problem rather than as the first statement that fails.
+    /// Every column reading a session names, so a changed layout reads as one
+    /// problem rather than as the first statement that fails. `directory` isn't
+    /// here: only `recentSessions` uses it, and a store without it shouldn't lose
+    /// Chat for that. That statement's "no such column" reads as a layout problem
+    /// too, through `OpenCodeProbe`'s reader failure.
     static let layoutStatement = """
         WITH need(t, c) AS (VALUES
           ('session_v2','id'),('session_v2','parent_id'),('session_v2','title'),('session_v2','version'),

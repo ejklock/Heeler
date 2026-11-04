@@ -17,6 +17,8 @@ struct AgentUsageContent: View {
             }
         case .requirement(let message):
             Text(message).foregroundStyle(.secondary)
+        case .hostHelper(let need):
+            Text(need.message).foregroundStyle(.secondary)
         case .unsupportedPlatform:
             Text("Not supported on Windows").foregroundStyle(.secondary)
         case .runtimeMissing:

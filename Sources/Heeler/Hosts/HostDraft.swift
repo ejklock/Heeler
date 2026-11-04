@@ -71,6 +71,10 @@ struct HostDraft: Equatable, Sendable {
     var name = ""
     var username = ""
     var authMethod: Host.AuthMethod = .deviceKey
+    /// A new Host is unconfirmed until its Host detail confirms a kind. Set from
+    /// the Host being edited or duplicated. Nothing in the form changes it
+    /// (ADR 0031).
+    private(set) var serverKind: ServerKind = .unconfirmed
     /// Blank means "keep the stored password" when editing.
     var password = ""
     var sessionName = ""
@@ -89,6 +93,7 @@ struct HostDraft: Equatable, Sendable {
         name = host.name
         username = host.username
         authMethod = host.authMethod
+        serverKind = host.serverKind
         sessionName = host.sessionName
         herdrEndpoint = host.herdrEndpoint
         routes = host.routes.map(HostRouteDraft.init(route:))
@@ -209,11 +214,10 @@ struct HostDraft: Equatable, Sendable {
     }
 
     var isValid: Bool {
-        let trimmedSessionName = sessionName.trimmingCharacters(in: .whitespaces)
         return !routes.isEmpty
             && routes.allSatisfy(\.isValid)
             && !username.trimmingCharacters(in: .whitespaces).isEmpty
-            && (trimmedSessionName.isEmpty || HerdrSessionName.isValid(trimmedSessionName))
+            && (herdrEndpoint == nil ? serverKind : .herdrTUI).isValidSessionName(sessionName)
     }
 
     /// Form-level validity including credential intent. A blank password can
@@ -238,7 +242,8 @@ struct HostDraft: Equatable, Sendable {
             name: name.trimmingCharacters(in: .whitespaces),
             username: username.trimmingCharacters(in: .whitespaces),
             authMethod: authMethod,
-            sessionName: sessionName.trimmingCharacters(in: .whitespaces),
+            serverKind: serverKind,
+            sessionName: serverKind.storedSessionName(sessionName),
             herdrEndpoint: herdrEndpoint,
             routes: routes)
     }

@@ -49,7 +49,8 @@ struct HostRemovalDependencies: Sendable {
     /// The removals under way. App-owned, so a Hosts list rebuilt mid-removal
     /// still shows them and another window cannot start the same one.
     var inFlight = HostRemovalsInFlight()
-    /// Whether the Host's connection is up, for the confirmation's copy.
+    /// Whether the Host can be asked to stop notifying this device, for the
+    /// confirmation's copy.
     var isConnected: @MainActor @Sendable (Host.ID) -> Bool = { _ in false }
     /// Whether this device holds a Notification Key for the Host.
     var hasNotificationKey: @MainActor @Sendable (Host.ID) -> Bool = { _ in false }
@@ -79,13 +80,13 @@ extension HostRemovalDependencies {
         revokeTimeout: Duration = .seconds(6)
     ) -> HostRemovalDependencies {
         HostRemovalDependencies(
-            isConnected: { [weak console] id in console?.hostStatuses[id] == .connected },
+            isConnected: { [weak console] id in console?.canReachNotificationFiles(id) == true },
             hasNotificationKey: { [weak notificationPreferences] id in
                 notificationPreferences?.hasNotificationKey(for: id) ?? false
             },
             revokeNotifications: { [weak console, weak notificationPreferences] host in
                 await notificationPreferences?.revokeRegistration(
-                    for: host, isConnected: console?.hostStatuses[host.id] == .connected,
+                    for: host, isConnected: console?.canReachNotificationFiles(host.id) == true,
                     timeout: revokeTimeout)
             },
             forgetNotificationKey: { [weak notificationPreferences] id in
@@ -212,6 +213,9 @@ struct HostListView: View {
     private let routeIDs: [Host.ID: HostRoute.ID]
     /// Why a connected Host's Agents could not be synced, per Host.
     private let syncIssues: [Host.ID: String]
+    private let coreEnvironmentNotices: [Host.ID: HerdrCoreEnvironmentNotice]
+    /// The Console, for the harness edits this device applied on a Host.
+    private let harnessEdits: ConsoleStore?
     /// Hosts whose Host-detail Reconnect request is in flight. Distinct from
     /// `EventsSessionStatus.reconnecting`.
     private let manualReconnectInFlightHostIDs: Set<Host.ID>
@@ -257,6 +261,8 @@ struct HostListView: View {
         latencies: [Host.ID: Duration] = [:],
         routeIDs: [Host.ID: HostRoute.ID] = [:],
         syncIssues: [Host.ID: String] = [:],
+        coreEnvironmentNotices: [Host.ID: HerdrCoreEnvironmentNotice] = [:],
+        harnessEdits: ConsoleStore? = nil,
         manualReconnectInFlightHostIDs: Set<Host.ID> = [],
         retryConnection: (@MainActor @Sendable (Host.ID) async -> Void)? = nil,
         stopConnecting: (@MainActor @Sendable (Host.ID) async -> Void)? = nil,
@@ -273,6 +279,8 @@ struct HostListView: View {
         self.latencies = latencies
         self.routeIDs = routeIDs
         self.syncIssues = syncIssues
+        self.coreEnvironmentNotices = coreEnvironmentNotices
+        self.harnessEdits = harnessEdits
         self.manualReconnectInFlightHostIDs = manualReconnectInFlightHostIDs
         self.retryConnection = retryConnection
         self.stopConnecting = stopConnecting
@@ -296,7 +304,7 @@ struct HostListView: View {
                             "The saved Host catalog could not be read. Its original data was preserved; "
                                 + "reinstalling or adding a Host would risk losing it.")
                     }
-                } else if store.hosts.isEmpty {
+                } else if store.hosts.isEmpty, store.coreCatalogLoadError == nil {
                     ContentUnavailableView {
                         Label("No Hosts", systemImage: "server.rack")
                     } description: {
@@ -313,6 +321,14 @@ struct HostListView: View {
                     }
                 } else {
                     List {
+                        if store.coreCatalogLoadError != nil {
+                            Section {
+                                Label(
+                                    "The saved herdr-core Hosts could not be read. Their original "
+                                        + "data was preserved, and no herdr-core Host can be added.",
+                                    systemImage: "externaldrive.badge.exclamationmark")
+                            }
+                        }
                         ForEach(HostListEntry.grouped(entries)) { @Sendable section in
                             MainActorContent {
                                 let isCollapsed = isCollapsed(section.group)
@@ -366,6 +382,8 @@ struct HostListView: View {
                         standingFailure: standingFailures[id],
                         connectedRouteID: routeIDs[id],
                         syncIssue: syncIssues[id],
+                        coreEnvironmentNotice: coreEnvironmentNotices[id],
+                        harnessEdits: harnessEdits,
                         isManualReconnectInFlight: manualReconnectInFlightHostIDs.contains(id),
                         retryConnection: retryAction(for: id),
                         stopConnecting: stopAction(for: id),
@@ -744,6 +762,8 @@ private struct HostGroupHeader: View {
 /// One Hosts list row. A problem is named by its Summary alone; Host
 /// detail, a tap away, shows the whole Transport Error Presentation.
 struct HostRowPresentation: Equatable {
+    /// Beside the name: which server the Host is for.
+    let serverKind: String
     let group: HostHealthGroup
     let tone: HostConnectionTone
     /// Under the name: the address while connected and in sync, otherwise
@@ -766,6 +786,17 @@ struct HostRowPresentation: Equatable {
         syncIssue: String? = nil,
         canRetry: Bool = true
     ) {
+        serverKind = host.serverKind.displayName
+        guard host.serverKind.isConfirmed else {
+            group = .notConnected
+            tone = .paused
+            detail = "Confirm its Server Kind"
+            isProblem = false
+            trailing = nil
+            offersRetry = false
+            isDialing = false
+            return
+        }
         let problem = HostConnectionDetailPresentation(
             host: host, status: status, standingFailure: standingFailure)
         let chip = HostConnectionPresentation(
@@ -826,9 +857,16 @@ private struct HostRowLabel: View {
         HStack(spacing: 12) {
             HostStatusGlyph(tone: presentation.tone)
             VStack(alignment: .leading, spacing: 2) {
-                Text(host.displayName)
-                    .font(.headline)
-                    .lineLimit(1)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(host.displayName)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Text(presentation.serverKind)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .layoutPriority(1)
+                }
                 Text(presentation.detail)
                     .font(.subheadline)
                     .foregroundStyle(presentation.isProblem ? Color.red : Color.secondary)

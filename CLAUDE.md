@@ -24,11 +24,17 @@ Native iOS companion app for [herdr](https://herdr.dev), an agent console over S
 - SwiftUI, iOS 18+, iPhone and iPad. SSH uses the repository-local
   `Packages/HeelerSSH` (pinned libssh2 and OpenSSL); terminal rendering uses the
   pinned libghostty-spm `GhosttyTerminal` product (ADRs 0001 and 0004).
-- Unix API and Events use NDJSON over direct-streamlocal channels to herdr's
-  socket. Unix Agent and shell terminals use PTY exec (ADR 0011).
-- Native Windows API and Events use `herdr remote-api-bridge`; live terminals
-  use `herdr terminal session control` over SSH exec (ADR 0018). This is a
+- On Herdr TUI Hosts, Unix API and Events use NDJSON over direct-streamlocal
+  channels to herdr's socket. Unix Agent and shell terminals use PTY exec
+  (ADR 0011).
+- On Herdr TUI Hosts, Native Windows API and Events use
+  `herdr remote-api-bridge`; live terminals use
+  `herdr terminal session control` over SSH exec (ADR 0018). This is a
   platform branch, never a fallback after Unix forwarding refusal.
+- herdr-core Hosts carry one framed link: direct-streamlocal to the core's
+  socket on Unix, SSH exec of `herdr-core connect` on native Windows after a
+  pipe check. Connecting never starts a core on Unix, and on Windows starts one
+  only if it stops in the round trip after that check (ADR 0031).
 - UI depends on `Transport`, not SSH library types. Pane ids are opaque strings.
   Protocol negotiation enforces a floor, ignores unknown fields, and treats the
   generated protocol version as advisory. API requests are one-shot; subscribe
@@ -56,15 +62,15 @@ Native iOS companion app for [herdr](https://herdr.dev), an agent console over S
 - User-visible changes get a `CHANGELOG.md` Unreleased entry referencing the PR;
   internal refactors and test work stay out. Domain term changes update
   `CONTEXT.md`; hard-to-reverse, surprising trade-offs get an ADR.
-- Release work follows [releasing.md](docs/guides/releasing.md): `make publish`
-  cuts CHANGELOG and versions and pushes the tag; `release.yml` signs and
-  uploads it. `make bump && make testflight` stays a local
-  interim upload. The release runner owns version edits and tags; a failed
-  release that published nothing keeps its version (re-run or re-cut).
+- TestFlight cuts, retries, signing rehearsals and migration follow
+  [releasing.md](docs/guides/releasing.md): `make testflight VERSION=X.Y.Z`
+  starts a version; `make testflight` cuts another immutable build tag.
+  App Store publication selects that build in App Store Connect, with no
+  extra tag or rebuild. Uncertain uploads require reconciliation, not re-upload.
 - The herdr plugin ships from the generated, append-only `plugin` branch
   ([ADR 0026](docs/adr/0026-plugin-distribution-branch.md)). Bump every
   version the plugin README's "Releasing a plugin version" lists, merge, then
-  run `make plugin` before the `make publish` that bundles it. Content
+  run `make plugin` before the `make testflight` that bundles it. Content
   changed without a bump stays on `main` until the next bump. `plugin/` on
   `main` stays directly installable, because older apps install from it.
 - Commits and PRs carry no attribution trailers or email addresses; local hooks

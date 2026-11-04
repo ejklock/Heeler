@@ -34,7 +34,7 @@ struct AgentChatSurfaceView: View {
     private let selectSurface: (AgentDetailSurface) -> Void
 
     @State private var timeline = ChatTimelineModel()
-    @State private var skills: SkillsPaneStore?
+    @State private var skillsStore: SkillsPaneStore?
     @State private var closer: ClosePaneStore
     /// This view's token with the Chat store, which follows the
     /// conversation while any window shows it.
@@ -56,6 +56,8 @@ struct AgentChatSurfaceView: View {
     @State private var collapseControlHeight: CGFloat = 0
     @State private var composerKeyboardPresentation: AgentComposerKeyboardPresentation = .hidden
     @State private var isConfirmingClose = false
+    @State private var openCodeEditFlow: HarnessConfigEditFlow?
+    @State private var windowsExtensionFlow: HerdrCoreWindowsExtensionFlow?
     @State private var closeRequest = AgentCloseRequest.closeAgent
     @State private var isSelectingPhoto = false
     @State private var isSelectingFile = false
@@ -74,6 +76,7 @@ struct AgentChatSurfaceView: View {
     /// it lists nothing.
     @State private var backgroundWorkHeight: CGFloat = 0
     @State private var isShowingBackgroundWork = false
+    @State private var isChoosingConversation = false
     /// The row the Background Work sheet opened from.
     @State private var backgroundWorkFocus: String?
     /// This view's own window, for hosts without a scene root.
@@ -137,20 +140,21 @@ struct AgentChatSurfaceView: View {
         self.selectSurface = selectSurface
         // Chat lists only the skills its `/` menu sends, in the menu, the
         // Skills sheet and the tools keyboard alike.
-        _skills = State(
+        _skillsStore = State(
             initialValue: AgentTerminalView.makeSkillsStore(for: agent, console: console) {
                 ChatCommandMenu.offers($0, for: program)
             })
         let paneID = agent.agent.paneID
         let hostID = agent.hostID
+        let corePin = session.corePin
         _agentKeys = State(
             initialValue: ChatAgentKeysStore { [console] keys in
-                try await console.sendAgentKeys(keys, to: paneID, on: hostID)
+                try await console.sendAgentKeys(keys, to: paneID, on: hostID, keepingTo: corePin)
             })
         _closer = State(
             initialValue: ClosePaneStore(paneTitle: AgentTerminalView.displayTitle(for: agent)) {
                 [console] in
-                try await console.closePane(paneID, on: hostID)
+                try await console.closePane(paneID, on: hostID, keepingTo: corePin)
             })
     }
 
@@ -181,6 +185,11 @@ struct AgentChatSurfaceView: View {
             toggleInputMode: nil,
             inputMode: .composer))
         .task { composer.open() }
+        // The screen in the conversation's place offers it, and so does the banner
+        // over a conversation Chat keeps.
+        .sheet(item: $openCodeEditFlow) { flow in
+            OpenCodePluginEditSheet(flow: flow)
+        }
     }
 
     private var presentedSurface: some View {
@@ -203,7 +212,9 @@ struct AgentChatSurfaceView: View {
                 origin: StartAgentStore.LaunchOrigin(
                     hostID: agent.hostID,
                     workspaceID: agent.agent.workspaceID,
-                    cwd: agent.agent.cwd),
+                    cwd: console.launchDirectory(
+                        ofWorkspace: agent.agent.workspaceID, asked: agent.agent.cwd,
+                        on: agent.hostID)),
                 onStarted: { switchToAgent($0) })
             .modifier(ConsoleSheetPresentationModifier(
                 presentation: ConsoleSheetPresentation(horizontalSizeClass: horizontalSizeClass),
@@ -233,6 +244,11 @@ struct AgentChatSurfaceView: View {
                         chat: chat, isHostConnected: isHostConnected, focus: backgroundWorkFocus,
                         sheetPresentation: $0)
                 }
+            }
+        }
+        .sheet(isPresented: $isChoosingConversation) {
+            if let chat {
+                ChatCandidatePickerView(chat: chat, corePin: session.corePin)
             }
         }
         .sheet(item: $viewingSkill) { skill in
@@ -270,7 +286,11 @@ struct AgentChatSurfaceView: View {
             "Couldn't Close Agent",
             isPresented: Binding(
                 get: { closeErrorMessage != nil },
-                set: { if !$0 { closeErrorMessage = nil } })
+                set: { presented in
+                    guard !presented else { return }
+                    closeErrorMessage = nil
+                    closer.dismissFailure()
+                })
         ) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -281,6 +301,7 @@ struct AgentChatSurfaceView: View {
     private var lifecycleSurface: some View {
         chatSurface
         .onAppear {
+            closer.didReturnToScreen()
             stageExit?.cancel()
             stageExit = nil
             if isOnStage() {
@@ -294,6 +315,9 @@ struct AgentChatSurfaceView: View {
             if presentation != .timeline { detailCrossfade?.contentDidAppear() }
         }
         .onDisappear {
+            closer.didLeaveScreen(
+                reportingTo: console.outcomeReporter(
+                    on: agent.hostID, title: "Couldn't Close Agent"))
             // SwiftUI also hands out disappears nobody caused; the router
             // says whether Chat really left.
             stageExit?.cancel()
@@ -315,6 +339,10 @@ struct AgentChatSurfaceView: View {
             // A new message shows at the end, so the list follows it there.
             let earlier = Set(previous.map(\.id))
             if messages.contains(where: { !earlier.contains($0.id) }) { followRequest += 1 }
+        }
+        .onChange(of: chat?.sendStatuses, initial: true) { _, statuses in
+            guard let statuses else { return }
+            composer.settleUnknownOutcomes(recorded: Set(statuses.filter { $0.value == .recorded }.keys))
         }
         .onChange(of: chat.map { $0.blocked.content != .none } ?? false) { _, isReplaced in
             // A Blocked card takes the Composer's place and the tools dock
@@ -577,6 +605,10 @@ struct AgentChatSurfaceView: View {
         switch presentation {
         case .timeline:
             EmptyView()
+        case .departed(let departure):
+            ContentUnavailableView(
+                departure.title, systemImage: departure.systemImage, description: Text(departure.explanation))
+            .accessibilityIdentifier("chat.departed")
         case .locating:
             ChatLocatingView()
         case .awaitingHost:
@@ -595,12 +627,27 @@ struct AgentChatSurfaceView: View {
             ChatUnavailableView(
                 reason: reason, launchNotice: chat?.launchNotice, isChecking: checkAgain != nil,
                 retry: { startCheckAgain() },
-                showAgentTerminal: { showAgentTerminal() })
+                showAgentTerminal: { showAgentTerminal() },
+                chooseConversation: offersCandidates ? { isChoosingConversation = true } : nil,
+                reviewEdit: reviewOpenCodeEdit,
+                addExtension: { windowsExtensionFlow = console.windowsExtensionFlow(for: agent.id, keepingTo: session.corePin) })
+            .sheet(item: $windowsExtensionFlow) { flow in
+                HerdrCoreWindowsExtensionSheet(flow: flow)
+            }
         case .disconnected:
             ContentUnavailableView(
                 "Not Connected", systemImage: "wifi.slash",
                 description: Text("Chat shows the conversation once this Agent's Host connects."))
         }
+    }
+
+    private func reviewOpenCodeEdit() {
+        openCodeEditFlow = console.openCodePluginEditFlow(for: agent.id, keepingTo: session.corePin)
+    }
+
+    /// Listing keeps to this detail's core, as everything it does on an address does.
+    private var offersCandidates: Bool {
+        (chat?.offersCandidates ?? false) && !console.hasLeftCore(session.corePin, on: agent.hostID)
     }
 
     /// Always present, so its measured height drops to zero with the last
@@ -613,7 +660,8 @@ struct AgentChatSurfaceView: View {
                     ChatBanner(
                         systemImage: banner.systemImage, text: banner.text,
                         showsProgress: banner.showsProgress, actionTitle: banner.actionTitle,
-                        action: banner.action)
+                        action: banner.action, secondaryActionTitle: banner.secondaryActionTitle,
+                        secondaryAction: banner.secondaryAction)
                 }
             }
         }
@@ -632,12 +680,15 @@ struct AgentChatSurfaceView: View {
         var showsProgress = false
         var actionTitle: String?
         var action: (() -> Void)?
+        var secondaryActionTitle: String?
+        var secondaryAction: (() -> Void)?
     }
 
     private var bannerContent: [Banner] {
         let lines = ChatBannerLine.lines(
             hostStatus: console.hostStatuses[agent.hostID], conversation: chat?.conversation,
-            hasPendingEchoes: !pendingEchoes.isEmpty, launchNotice: chat?.launchNotice)
+            hasPendingEchoes: !pendingEchoes.isEmpty, launchNotice: chat?.launchNotice,
+            departure: console.chatDeparture(of: agent.id))
         let terminalOffered = lines.contains {
             if case .unavailable(let reason, _) = $0 { !reason.isWaiting } else { false }
         }
@@ -651,10 +702,20 @@ struct AgentChatSurfaceView: View {
                 banner.actionTitle = "Retry"
                 banner.action = { chat?.retry() }
             case .unavailable(let reason, _):
-                if !reason.isWaiting {
+                if offersCandidates {
+                    banner.actionTitle = ChatCandidatePickerView.title
+                    banner.action = { isChoosingConversation = true }
+                } else if !reason.isWaiting {
                     banner.actionTitle = AgentDetailSurface.terminal.showTitle
                     banner.action = { showAgentTerminal() }
                 }
+                if reason.offersOpenCodePluginEdit {
+                    banner.secondaryActionTitle = OpenCodePluginEdit.offerTitle
+                    banner.secondaryAction = reviewOpenCodeEdit
+                }
+            case .departure:
+                banner.actionTitle = AgentDetailSurface.terminal.showTitle
+                banner.action = { showAgentTerminal() }
             case .launch:
                 if !terminalOffered {
                     banner.actionTitle = AgentDetailSurface.terminal.showTitle
@@ -675,7 +736,8 @@ struct AgentChatSurfaceView: View {
     private var livePresentation: ChatSurfacePresentation {
         ChatSurfacePresentation(
             conversation: chat?.conversation, hasPendingEchoes: !pendingEchoes.isEmpty,
-            isHostConnected: isHostConnected, checkingLaunch: chat?.isCheckingLaunch ?? false)
+            isHostConnected: isHostConnected, checkingLaunch: chat?.isCheckingLaunch ?? false,
+            departure: console.chatDeparture(of: agent.id))
     }
 
     private func startCheckAgain() {
@@ -801,6 +863,11 @@ struct AgentChatSurfaceView: View {
 
     // MARK: Composer
 
+    /// What every Skills entry here reads: nil hides them, the `/` menu's included.
+    private var skills: SkillsPaneStore? {
+        console.capabilities(for: agent.hostID).hostScripts ? skillsStore : nil
+    }
+
     /// The `/` menu: the Host's skills once loaded, plus `/compact`.
     private var commands: [ChatCommand] {
         ChatCommandMenu.commands(
@@ -824,10 +891,11 @@ struct AgentChatSurfaceView: View {
     }
 
     /// Whether the program still shows the conversation Chat shows, for a
-    /// program that can leave it without herdr reporting it. Without a
-    /// store there is nothing to check with, so nothing is sent.
+    /// program that can leave it without herdr reporting it, and for any on a
+    /// herdr-core Host. Without a store there is nothing to check with, so
+    /// nothing is sent.
     private var confirmSession: (@MainActor () async -> String?)? {
-        guard program.confirmsSessionBeforeSend else { return nil }
+        guard chat?.confirmsSessionBeforeSend ?? program.confirmsSessionBeforeSend else { return nil }
         let chat = chat
         let program = program
         return {
@@ -867,8 +935,9 @@ struct AgentChatSurfaceView: View {
         let paneID = agent.agent.paneID
         let hostID = agent.hostID
         let chat = chat
+        let corePin = session.corePin
         return { [console] in
-            let screen = try await console.readAgentScreen(paneID, on: hostID)
+            let screen = try await console.readAgentScreen(paneID, on: hostID, keepingTo: corePin)
             // A steer shown as returned may since have left the box.
             chat?.inputBoxWasRead(screen)
             return screen
@@ -910,7 +979,7 @@ struct AgentChatSurfaceView: View {
     /// Chat's Stop: the program's Stop plan, in line with the Agent page's
     /// keys, as typed keys would arrive.
     private var stopInterrupt: AgentComposerInterrupt {
-        ChatStopPlan.standard(for: program).composerInterrupt(context: stopContext, agentKeys: agentKeys)
+        console.chatStopPlan(for: agent, program: program).composerInterrupt(context: stopContext, agentKeys: agentKeys)
     }
 
     /// What a Stop guard reads: the screen, then herdr's status.
@@ -985,7 +1054,8 @@ struct AgentChatSurfaceView: View {
     }
 
     private var composerActions: AgentComposerActions {
-        AgentComposerActions(
+        let capabilities = console.capabilities(for: agent.hostID)
+        return AgentComposerActions(
             canBegin: session.staging.canBegin,
             attachLinkCount: 0,
             addImage: { isSelectingPhoto = true },
@@ -1003,8 +1073,9 @@ struct AgentChatSurfaceView: View {
             manageSnippets: { isManagingSnippets = true },
             showSkills: skills != nil ? { isShowingSkillsPicker = true } : nil,
             showWorktreeDetails: nil,
-            renameAgent: { isRenamingAgent = true },
-            renameWorkspace: { isRenamingWorkspace = true },
+            renameAgent: capabilities.renameAgent ? { isRenamingAgent = true } : nil,
+            renameWorkspace: capabilities.renameWorkspace(id: agent.agent.workspaceID)
+                ? { isRenamingWorkspace = true } : nil,
             closeAgent: {
                 closeRequest = console.closeRequest(for: agent.id)
                 isConfirmingClose = true

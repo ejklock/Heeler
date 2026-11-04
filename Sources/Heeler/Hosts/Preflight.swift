@@ -16,13 +16,15 @@ enum PreflightCheck: CaseIterable, Sendable {
     /// The server speaks a protocol version this build supports.
     case protocolCompatible
 
-    var title: String {
-        switch self {
-        case .connection: "SSH connection"
-        case .remoteEnvironment: "remote environment"
-        case .herdrInstalled: "herdr installed"
-        case .serverRunning: "herdr server running"
-        case .protocolCompatible: "protocol compatible"
+    func title(for serverKind: ServerKind) -> String {
+        switch (self, serverKind) {
+        case (.connection, _): "SSH connection"
+        case (.remoteEnvironment, _): "remote environment"
+        case (.herdrInstalled, .herdrTUI), (.herdrInstalled, .unconfirmed): "herdr installed"
+        case (.herdrInstalled, .herdrCore): "herdr-core installed"
+        case (.serverRunning, .herdrTUI), (.serverRunning, .unconfirmed): "herdr server running"
+        case (.serverRunning, .herdrCore): "herdr-core running"
+        case (.protocolCompatible, _): "protocol compatible"
         }
     }
 }
@@ -65,7 +67,7 @@ struct PreflightReport: Equatable, Sendable {
         switch error {
         case .hostFeatureUnavailable(let feature):
             check = .remoteEnvironment
-            hint = feature + "."
+            hint = feature.hasSuffix(".") ? feature : feature + "."
         case .sshUnreachable(let detail):
             check = .connection
             hint = "Could not reach the Host over SSH. Check the address and port. (\(detail))"
@@ -160,6 +162,22 @@ struct PreflightReport: Equatable, Sendable {
         case .timedOut:
             check = .connection
             hint = "The Host did not answer in time. Check the connection and try again."
+        case .coreMutationOutcomeUnknown:
+            check = .connection
+            hint = "The Host did not confirm the action. Check its state before trying again."
+        case .herdrCoreInventoryStale, .herdrCoreTerminalGone:
+            // Preflight has no inventory; keep the closed taxonomy total.
+            check = .connection
+            hint = error.presentation.message
+        case .herdrCoreNotInstalled:
+            check = .herdrInstalled
+            hint = error.presentation.message
+        case .herdrCoreNotRunning, .herdrCoreSocketPathTooLong, .herdrCoreForwardingRefused:
+            check = .serverRunning
+            hint = error.presentation.message
+        case .herdrCoreUpdateRequired:
+            check = .protocolCompatible
+            hint = error.presentation.message
         case .gitTimedOut:
             // Preflight never reads Changes; keep the closed taxonomy total.
             check = .connection
@@ -315,5 +333,10 @@ struct PreflightReport: Equatable, Sendable {
 
     var isFullyPassed: Bool {
         failure == nil
+    }
+
+    /// The failed check's fix-it, for a status that went unread because of it.
+    var failureHint: String? {
+        failure?.hint
     }
 }

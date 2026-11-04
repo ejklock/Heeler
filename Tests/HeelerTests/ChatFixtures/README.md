@@ -35,6 +35,38 @@ None came from a personal session.
 | `grok/background-tasks.jsonl` | Written for the test, not captured: a command started in the background, a command Grok moved to the background while it ran, and a subagent spawned in the background, with their `task_backgrounded` and `subagent_spawned` records, then the commands' `task_completed` records (one exited 0, one was killed) and the subagent's `subagent_finished`; then a monitor, whose `task_backgrounded` comes before its input update, whose result holds no output, and whose output comes with a `task_completed` of kind `monitor`. The records take the shapes Grok Build's source writes |
 | `grok/failed-tools.jsonl` | Written for the test, not captured: one turn of failed calls, a `tool_execution_failed` error, the tagged failures `FileNotFound`, `FileTooLarge`, `NotADirectory`, `NotFound`, `NoMatchesFound`, `MultipleMatchesFound` and `InvalidInput`, and an MCP call that returned an error. The records take the shapes a census of real failures found; some carry no content |
 
+`host-evidence/` is a separate recording, for the herdr-core session binding of
+ADR 0034. `HerdrCoreProgramBinderTests` reads the `.json` scenes of `codex/`, `grok/`
+and `opencode/`, `OpenCodeStoreQueryTests` the schemas, and the Pi and Oh My Pi binder
+tests the scenes and core event streams of `pi/` and `omp/` through `PiHostEvidence`.
+No test reads `reply-held.json`, `omp/session-lock-by-id.json`, since no check reads a
+lock, or the Codex, Grok Build and OpenCode core event streams, whose captures start
+after a Terminal's `created` or scrub the argv a record needs, so those tests build
+their records from the scene's rows and write OpenCode's title events by hand. An
+extension's label is also written by hand there, not by `heeler-session.js`, whose
+output `plugin/test/helper-extensions.test.js` holds on its side. It came from a throwaway Linux VM on
+2026-11-01 with herdr-core 0.1.13 and a local fake model behind a dummy key.
+Nothing was signed in and it is not from hc-lab, so an account could change
+what it shows; `docs/agents/herdr-compatibility.md` says how for each program.
+Each `.json` names its harness version, method and what was observed, and holds
+process rows shaped for `ScriptedProcessTable.Process`, plus the files as read.
+
+| Path | Source |
+| --- | --- |
+| `host-evidence/codex/no-daemon.json` | Codex CLI 0.165.0 `--no-daemon`: the process tree and held files at the prompt and after the first reply, and the rollout's `session_meta` |
+| `host-evidence/codex/no-daemon-after-new.json` | The same, before `/new` and after a prompt in the new thread: two held root rollouts. Its `observed` text alone says what the first prompt after `/new` leaves, the new thread's lock with no rollout, and the test that uses this says it edits the recording |
+| `host-evidence/codex/no-daemon-subagent.json` | The same, with a root and a subagent the fake model spawned |
+| `host-evidence/codex/default-daemon.json` | Plain `codex` in two Terminals on one `CODEX_HOME`: the shared daemon, the `HC_SCOPE` it carries and the rollouts it holds |
+| `host-evidence/grok/s-flag.json` | Grok Build 1.0.70 `-s`: `active_sessions.json` with one Terminal, with two, and after `/new`, `pid_start` against field 22 of `/proc/<pid>/stat`, and leader mode |
+| `host-evidence/opencode/ses-flag-2.2.5.json`, `ses-flag-2.0.32.json` | OpenCode `-s ses…`: its rows in `session_v2`, each message's type and `data` keys, and the service process |
+| `host-evidence/opencode/schema-2.2.5.sql`, `schema-2.0.32.sql` | Each version's `opencode.db` schema from `sqlite_master`, whole: 24 tables on 2.2.5, 20 on 2.0.32, with their indexes |
+| `host-evidence/pi/session-files-0.85.1.json`, `session-files-1.4.0.json` | Pi `--session-id`, `/new` and no flag: when each session file appeared, its header and line types, and the bare process |
+| `host-evidence/omp/breadcrumb-and-session-files.json` | Oh My Pi 18.13.3: the breadcrumb through a process's life and the next one's, session files, the open file, the session lock, and how far the security scan got |
+| `host-evidence/omp/session-lock-by-id.json` | Oh My Pi 18.13.3: the lock its process holds while the title is held, and the names its own `tryAcquireSessionLease` binds for the same ids and for invented ids and homes. The hash is not identified |
+| `host-evidence/macos/vm-26.5.json` | herdr-core 0.1.13 on macOS 26.5 in a throwaway VM with SIP off, no sign-in and a fake model: each program's rows as `HostProcessReader`'s macOS script read them, trimmed to terminals and session files, the core's record, and the files as read. Rollouts keep their first line's identifying fields. Its `record` field is the core's `terminal.get` |
+| `host-evidence/reply-held.json` | All five with the fake model holding each reply, Pi on 0.85.1 and 1.4.0 and OpenCode on 2.0.32 and 2.2.5: what existed during the hold |
+| `host-evidence/*/*-core-events.ndjson` | The core's event stream for the same runs, from `scripts/lab/herdr-core-capture.py` |
+
 ## Scrubbing
 
 The probe tooling already re-serialized each JSON line, replaced attachment
@@ -79,6 +111,20 @@ the one `cancel-takeover.jsonl` keeps under a renamed run; herdr's
 from the same range only. Searching `grok/` for a UUID outside that range, a
 `global/settings` run or the account name, in text or in a byte array, finds
 nothing.
+
+Host evidence captures were rebuilt from raw recordings, so unlike the above
+they are not byte for byte and offsets do not hold:
+
+- Only `HC_SCOPE` of any process's environment is kept, and its hex becomes a
+  counter. No key, prompt, reply or title is kept: `base_instructions` and
+  titles read `<scrubbed>`, and messages keep only their type and `data` keys.
+- Every UUID, `ses_` and `msg_` id becomes a synthetic one of the same form,
+  consistent within a file, including in file names and `HC_SCOPE`. Pids,
+  process starts, timestamps and the Oh My Pi lock's hash are as recorded.
+- The VM's user becomes `user` (`/home/user`, plain, percent-encoded and in
+  session folder names), and its host name and core id go.
+- The core events went through the capture script's scrubbing, then the same
+  id mapping.
 
 After adding a capture, check that searching this directory for `/Users/`
 (other than `/Users/developer`), `ghp_`, `Bearer` and e-mail addresses finds
@@ -201,6 +247,17 @@ Scrubbing replaced the account name as above and the shell prompt's
 `user@host` with `developer@probe-host-placeholder-01`, both with
 replacements of the same length. These screens are not part of
 `ScreenFixture.all`, which the dialog and input-box suites walk.
+
+### Core paints
+
+`screens/core-paint/*.paint` are the first paint of an observing attach from
+herdr-core 0.1.13 through `scripts/fixtures/herdr-core-ssh.py` on 2026-10-31,
+with no harness signed in: an inert program replayed the `.ansi` screen of the
+same name in a core Terminal at that screen's size. So the screen drawn is the
+earlier capture's, and the bytes around it are the core's. `modes-*` are not
+replays: the program set the alternate screen, bracketed paste, kitty flags 9
+and application cursor keys, or nothing. These are provisional until a live
+Agent on a core is captured.
 
 ### Grok Build screens
 

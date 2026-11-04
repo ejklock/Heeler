@@ -8,6 +8,70 @@ import Testing
 /// `sqlite3` reads them (`OpenCodeSQLiteHarness`).
 @Suite("OpenCode store queries")
 struct OpenCodeStoreQueryTests {
+    // MARK: The schemas OpenCode itself made
+
+    /// `host-evidence/opencode/schema-*.sql` came from real stores of these versions
+    /// (ADR 0034), with no real provider's rows. The queries run against them, on
+    /// captured rows of OpenCode 2.0.32's shape.
+    @Test(arguments: ["2.2.5", "2.0.32"])
+    func theQueriesRunAgainstARecordedSchema(_ version: String) throws {
+        let schema = try ChatFixture.text("host-evidence/opencode/schema-\(version).sql")
+        let fixture = try OpenCodeStoreFixture.named("pong")
+        let session = try #require(fixture.sessionID)
+        let harness = try OpenCodeSQLiteHarness(fixture, schema: schema)
+
+        let tail = try harness.records(Self.tail(session))
+        #expect(tail.rows.map(\.seq) == fixture.rows.map(\.seq))
+        let cursor = try Self.cursor(after: tail)
+        #expect(try harness.response(OpenCodeQuery(session: session, kind: .poll(cursor))) == .unchanged(eventSeq: 12))
+        let other = try #require(OpenCodeSessionID("ses_e6a000000001Abcdefghijklmn"))
+        #expect(
+            try harness.response(OpenCodeQuery(session: other, kind: .tail(budget: 1024)))
+                == .sessionMissing(otherStores: []))
+    }
+
+    // MARK: Recent sessions in a directory
+
+    /// Chat's candidate list (ADR 0034), against what OpenCode's own stores hold.
+    @Test(arguments: ["2.2.5", "2.0.32"])
+    func recentSessionsAreTheDirectorysRootsNewestFirst(_ version: String) throws {
+        let schema = try ChatFixture.text("host-evidence/opencode/schema-\(version).sql")
+        let fixture = try OpenCodeStoreFixture.named("pong")
+        let harness = try OpenCodeSQLiteHarness(fixture, schema: schema)
+        let directory = "/work/it's \"odd\"; app"
+        func add(_ id: String, directory: String, updated: Int64, parent: String? = nil) throws {
+            var row = fixture.session
+            row["id"] = .text(id)
+            row["slug"] = .text(id)
+            row["directory"] = .text(directory)
+            row["time_updated"] = .integer(updated)
+            row["parent_id"] = parent.map(OpenCodeColumnValue.text) ?? .null
+            try harness.insert(into: "session_v2", row)
+        }
+        try add("ses_e6a000000001Abcdefghijklmn", directory: directory, updated: 100)
+        try add("ses_e6a000000002Abcdefghijklmn", directory: directory, updated: 300)
+        try add("ses_e6a000000003Abcdefghijklmn", directory: directory, updated: 200)
+        try add("ses_e6a000000004Abcdefghijklmn", directory: directory, updated: 400, parent: "ses_e6a000000001Abcdefghijklmn")
+        try add("ses_e6a000000005Abcdefghijklmn", directory: "/work/other", updated: 500)
+
+        let query = OpenCodeQuery(session: nil, kind: .recentSessions(directory: directory, limit: 2))
+        let rows = try harness.records(query).recentSessions
+
+        #expect(rows.map(\.id) == ["ses_e6a000000002Abcdefghijklmn", "ses_e6a000000003Abcdefghijklmn"])
+        #expect(rows.map(\.updated) == [300, 200])
+        #expect(rows.first?.title == "Pong")
+    }
+
+    @Test func recentSessionsParseOnTheParserStackOfOlderSQLite() throws {
+        let harness = try OpenCodeSQLiteHarness(scenario: "pong")
+        let query = OpenCodeQuery(session: nil, kind: .recentSessions(directory: "/work/app", limit: 12))
+        for statement in OpenCodeProbe.statements(query) {
+            #expect(
+                harness.prepareFailure(statement, parserStack: OpenCodeSQLiteHarness.fixedParserStack) == nil,
+                "\(statement.prefix(60))")
+        }
+    }
+
     // MARK: Tail, poll and older pages
 
     @Test func aTailReadsTheNewestRowsWithinItsBudget() throws {

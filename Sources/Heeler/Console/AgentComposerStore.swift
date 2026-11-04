@@ -39,6 +39,10 @@ final class AgentComposerStore: ComposerDraftOperations {
         /// `agent.prompt` succeeded but the text stayed in the Agent's input
         /// box. Never resent: the user decides in the terminal.
         case undelivered
+        /// A herdr-core step got no answer, so the paste or its submit may
+        /// still reach the program. Retry refuses it: the user decides what the
+        /// terminal shows.
+        case outcomeUnknown
     }
 
     enum AgentProgress: Equatable {
@@ -54,9 +58,14 @@ final class AgentComposerStore: ComposerDraftOperations {
         case ignored
         case deliveredViaPrompt
         case deliveredViaAttach
+        /// A herdr-core Send pasted through the Attach and pressed the submit
+        /// key after its checks.
+        case submittedViaAttach
         case failed
         /// The policy declined the draft, which is back in the Composer.
         case refused(ComposerRefusal)
+        /// A herdr-core step got no answer. The message stays as it is.
+        case outcomeUnknown
     }
 
     private(set) var messages: [Message] = []
@@ -88,6 +97,8 @@ final class AgentComposerStore: ComposerDraftOperations {
     private let agentNotReadyRetryDelay: Duration
     private let agentNotReadyRetryBudget: Duration
     private let prompt: @Sendable (AgentPromptParams) async throws -> Agent
+    /// How a herdr-core Host delivers instead of `prompt` (ADR 0035).
+    @ObservationIgnored private let coreSend: HerdrCoreComposerSend?
     @ObservationIgnored private var hasOpened = false
     @ObservationIgnored private var statusTask: Task<Void, Never>?
     /// The detail screen's live Attach writer. Weak: Composer outlives any
@@ -132,12 +143,14 @@ final class AgentComposerStore: ComposerDraftOperations {
         agentNotReadyRetryDelay: Duration = AgentComposerStore.defaultAgentNotReadyRetryDelay,
         agentNotReadyRetryBudget: Duration = AgentComposerStore.defaultAgentNotReadyRetryBudget,
         stop: AgentComposerStopStore = AgentComposerStopStore(),
+        coreSend: HerdrCoreComposerSend? = nil,
         prompt: @escaping @Sendable (AgentPromptParams) async throws -> Agent
     ) {
         self.target = target
         agentStatus = initialStatus
         self.statusUpdates = statusUpdates
         self.stop = stop
+        self.coreSend = coreSend
         self.agentNotReadyRetryDelay = agentNotReadyRetryDelay
         self.agentNotReadyRetryBudget = agentNotReadyRetryBudget
         self.prompt = prompt
@@ -385,12 +398,15 @@ final class AgentComposerStore: ComposerDraftOperations {
         return result
     }
 
-    /// Removes a failed echo and restores all of its text to the draft. If
-    /// the user has already started another draft, both are kept in order.
+    /// Removes a failed or unanswered echo and restores all of its text to the
+    /// draft. If the user has already started another draft, both are kept in
+    /// order. An unanswered one is the user's call, having seen the terminal.
     func withdrawToDraft(_ id: Message.ID) {
         guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
-        guard case .failed = messages[index].state else { return }
-        returnToDraft(id)
+        switch messages[index].state {
+        case .failed, .outcomeUnknown: returnToDraft(id)
+        case .sending, .delivered, .undelivered: break
+        }
     }
 
     /// Removes an echo and puts its text back in front of whatever has been
@@ -400,6 +416,15 @@ final class AgentComposerStore: ComposerDraftOperations {
         let text = messages.remove(at: index).text
         draft = draft.isEmpty ? text : "\(text)\n\(draft)"
         draftSelection = NSRange(location: (draft as NSString).length, length: 0)
+    }
+
+    /// The Transcript recorded these, so a step with no answer reached the
+    /// program after all, and nothing is left to decide about them.
+    func settleUnknownOutcomes(recorded: Set<Message.ID>) {
+        for index in messages.indices
+        where messages[index].state == .outcomeUnknown && recorded.contains(messages[index].id) {
+            messages[index].state = .delivered(.acknowledged)
+        }
     }
 
     func agentStatusDidChange(_ status: AgentStatus) {
@@ -438,6 +463,9 @@ final class AgentComposerStore: ComposerDraftOperations {
         if Self.containsDropPlaceholder(text) {
             return .ignored
         }
+        if let coreSend {
+            return await deliverThroughCore(id, text: text, policy: policy, using: coreSend)
+        }
         if agentStatus == .blocked {
             return deliverWhileBlocked(id, text: text, policy: policy)
         }
@@ -467,6 +495,41 @@ final class AgentComposerStore: ComposerDraftOperations {
                 return deliverWhileBlocked(id, text: text, policy: policy)
             }
             return fail(id, message: Self.message(for: error))
+        }
+    }
+
+    private func deliverThroughCore(
+        _ id: Message.ID, text: String, policy: ComposerDeliveryPolicy, using coreSend: HerdrCoreComposerSend
+    ) async -> SendResult {
+        let outgoing = policy.outgoingText(text)
+        guard TerminalTextSafety.containsOnlySafeScalars(outgoing) else {
+            return fail(id, message: Self.unsafeTextMessage)
+        }
+        let outcome = await coreSend.send(outgoing, route: policy.route, attach: policy.coreAttach)
+        guard let index = messages.firstIndex(where: { $0.id == id }) else { return .ignored }
+        switch outcome {
+        case .submitted:
+            messages[index].state = .delivered(progressAfterAcknowledgment(for: messages[index]))
+            if let verify = policy.verify {
+                Task { [weak self] in
+                    guard !(await verify(outgoing)) else { return }
+                    self?.markUndelivered(id)
+                }
+            }
+            return .submittedViaAttach
+        case .pasted:
+            messages[index].tracksAgentProgress = false
+            messages[index].state = .delivered(.acknowledged)
+            return .deliveredViaAttach
+        case .refused(let refusal):
+            returnToDraft(id)
+            return .refused(refusal)
+        case .failed(let message):
+            return fail(id, message: message)
+        case .outcomeUnknown:
+            messages[index].tracksAgentProgress = false
+            messages[index].state = .outcomeUnknown
+            return .outcomeUnknown
         }
     }
 
