@@ -231,6 +231,13 @@ class ReaderTestCase(unittest.TestCase):
             with self.subTest(shell=" ".join(shell)):
                 check(shell)
 
+    def for_each_shell_reading_path_uname(self, check) -> None:
+        for shell in shells():
+            with self.subTest(shell=" ".join(shell)):
+                if Path(shell[0]).name == "busybox":
+                    self.skipTest("busybox sh runs its own uname applet before PATH, so a stub cannot reach it")
+                check(shell)
+
 
 class StartTimeTests(ReaderTestCase):
     def test_reads_field_22_of_stat(self) -> None:
@@ -603,7 +610,7 @@ class DescendantTests(ReaderTestCase):
                 env={"PATH": f"{tools}:/usr/bin:/bin"},
             )
             self.assertEqual(self.parse(result.stdout.decode(), **request)["1"]["descendants"], "unavailable")
-        self.for_each_shell(check)
+        self.for_each_shell_reading_path_uname(check)
 
 
 class ArgumentTests(ReaderTestCase):
@@ -700,7 +707,7 @@ class UnknownKernelTests(ReaderTestCase):
                 "names": "unavailable",
                 "files": "unavailable",
             })
-        self.for_each_shell(check)
+        self.for_each_shell_reading_path_uname(check)
 
 
 @unittest.skipUnless(sys.platform == "darwin", "the macOS reads need a Mac")
